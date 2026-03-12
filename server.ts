@@ -1,288 +1,294 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import Database from "better-sqlite3";
 import { fileURLToPath } from "url";
+import mysql from "mysql2/promise";
+import "dotenv/config";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("database.sqlite");
+// ─── Conexão com MySQL Remoto ────────────────────────────────────────────────
+const pool = mysql.createPool({
+  host:     process.env.DB_HOST     || "localhost",
+  port:     Number(process.env.DB_PORT) || 3306,
+  user:     process.env.DB_USER     || "root",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME     || "sisrenilcenene",
+  waitForConnections: true,
+  connectionLimit:    10,
+  queueLimit:         0,
+  charset:            "utf8mb4",
+  timezone:           "local",
+});
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS usuarios (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    senha TEXT NOT NULL,
-    perfil TEXT NOT NULL, -- Administrador, Coordenador Geral, Coordenador de Grupo, Operador, Visualização
-    grupo TEXT, -- Fora da Igreja, Igreja / Pastores
-    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS liderancas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    grupo TEXT NOT NULL, -- Fora da Igreja, Igreja / Pastores
-    nome_lideranca TEXT NOT NULL,
-    data_aniversario DATE,
-    fone_zap TEXT,
-    cidade TEXT,
-    bairro TEXT,
-    indicacao TEXT,
-    acompanhado_por TEXT,
-    situacao TEXT DEFAULT 'ativo', -- ativo, em acompanhamento, pendente, inativo
-    demanda_recebida TEXT,
-    compromisso_politico TEXT DEFAULT 'indefinido', -- forte, médio, baixo, indefinido
-    percentual_votos_municipio REAL DEFAULT 0,
-    ultima_visita DATE,
-    votos_nene INTEGER DEFAULT 0,
-    votos_renilce INTEGER DEFAULT 0,
-    observacoes TEXT,
-    responsavel_cadastro TEXT,
-    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP,
-    data_atualizacao DATETIME DEFAULT CURRENT_TIMESTAMP,
-    proxima_visita DATE,
-    prioridade TEXT DEFAULT 'média' -- alta, média, baixa
-  );
-
-  CREATE TABLE IF NOT EXISTS visitas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lideranca_id INTEGER,
-    data_visita DATE,
-    relato TEXT,
-    responsavel TEXT,
-    FOREIGN KEY (lideranca_id) REFERENCES liderancas(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS demandas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lideranca_id INTEGER,
-    descricao TEXT,
-    status TEXT DEFAULT 'aberta',
-    data_abertura DATETIME DEFAULT CURRENT_TIMESTAMP,
-    data_conclusao DATETIME,
-    FOREIGN KEY (lideranca_id) REFERENCES liderancas(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    usuario_id INTEGER,
-    acao TEXT,
-    detalhes TEXT,
-    data_hora DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS agendas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    titulo TEXT NOT NULL,
-    data DATE NOT NULL,
-    hora TEXT,
-    cidade TEXT NOT NULL,
-    local TEXT,
-    descricao TEXT,
-    aviso INTEGER DEFAULT 0, -- 0 for false, 1 for true
-    status TEXT DEFAULT 'pendente', -- confirmado, pendente, cancelado
-    data_cadastro DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-// Migration: Add acompanhado_por if it doesn't exist
-try {
-  db.prepare("ALTER TABLE liderancas ADD COLUMN acompanhado_por TEXT").run();
-} catch (e) {
-  // Column already exists or table doesn't exist yet
+// Testa conexão na inicialização
+async function testConnection() {
+  try {
+    const conn = await pool.getConnection();
+    console.log("✅ Conectado ao MySQL remoto com sucesso!");
+    conn.release();
+  } catch (err: any) {
+    console.error("❌ Falha ao conectar ao MySQL:", err.message);
+    process.exit(1);
+  }
 }
 
-// Seed Admin if not exists
-const adminExists = db.prepare("SELECT * FROM usuarios WHERE email = ?").get("admin@campanha.com");
-if (!adminExists) {
-  db.prepare("INSERT INTO usuarios (nome, email, senha, perfil) VALUES (?, ?, ?, ?)").run(
-    "Administrador",
-    "admin@campanha.com",
-    "admin123",
-    "Administrador"
-  );
+// Helper: executa query e retorna rows
+async function query<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+  const [rows] = await pool.execute(sql, params);
+  return rows as T[];
 }
 
+// Helper: executa INSERT/UPDATE/DELETE e retorna result
+async function execute(sql: string, params: any[] = []) {
+  const [result] = await pool.execute(sql, params);
+  return result as mysql.ResultSetHeader;
+}
+
+// ─── Seed: cria admin padrão caso não exista ─────────────────────────────────
+async function seedAdmin() {
+  const rows = await query("SELECT id FROM usuarios WHERE email = ?", ["admin@campanha.com"]);
+  if (rows.length === 0) {
+    // Em produção, use um hash bcrypt real para a senha
+    await execute(
+      "INSERT INTO usuarios (nome, email, senha, perfil) VALUES (?, ?, ?, ?)",
+      ["Administrador", "admin@campanha.com", "admin123", "Administrador"]
+    );
+    console.log("ℹ️  Usuário admin criado (admin@campanha.com / admin123). Troque a senha!");
+  }
+}
+
+// ─── Servidor ────────────────────────────────────────────────────────────────
 async function startServer() {
+  await testConnection();
+  await seedAdmin();
+
   const app = express();
   app.use(express.json());
 
-  // API Routes
-  app.get("/api/stats", (req, res) => {
-    const total = db.prepare("SELECT COUNT(*) as count FROM liderancas").get().count;
-    const foraIgreja = db.prepare("SELECT COUNT(*) as count FROM liderancas WHERE grupo = 'Fora da Igreja'").get().count;
-    const igreja = db.prepare("SELECT COUNT(*) as count FROM liderancas WHERE grupo = 'Igreja / Pastores'").get().count;
-    const votosNene = db.prepare("SELECT SUM(votos_nene) as sum FROM liderancas").get().sum || 0;
-    const votosRenilce = db.prepare("SELECT SUM(votos_renilce) as sum FROM liderancas").get().sum || 0;
-    
-    const rankingCidades = db.prepare(`
-      SELECT cidade, SUM(votos_nene + votos_renilce) as total_votos 
-      FROM liderancas 
-      GROUP BY cidade 
-      ORDER BY total_votos DESC 
-      LIMIT 5
-    `).all();
+  // ── API: Stats (Dashboard) ───────────────────────────────────────────────
+  app.get("/api/stats", async (_req, res) => {
+    try {
+      const [totalRow]       = await query<any>("SELECT COUNT(*) as count FROM liderancas");
+      const [foraIgrejaRow]  = await query<any>("SELECT COUNT(*) as count FROM liderancas WHERE grupo = 'Fora da Igreja'");
+      const [igrejaRow]      = await query<any>("SELECT COUNT(*) as count FROM liderancas WHERE grupo = 'Igreja / Pastores'");
+      const [votosNeneRow]   = await query<any>("SELECT COALESCE(SUM(votos_nene), 0) as soma FROM liderancas");
+      const [votosRenilceRow]= await query<any>("SELECT COALESCE(SUM(votos_renilce), 0) as soma FROM liderancas");
 
-    const rankingBairros = db.prepare(`
-      SELECT bairro, SUM(votos_nene + votos_renilce) as total_votos 
-      FROM liderancas 
-      GROUP BY bairro 
-      ORDER BY total_votos DESC 
-      LIMIT 5
-    `).all();
+      const rankingCidades = await query<any>(`
+        SELECT cidade, SUM(votos_nene + votos_renilce) AS total_votos
+        FROM liderancas
+        GROUP BY cidade
+        ORDER BY total_votos DESC
+        LIMIT 5
+      `);
 
-    res.json({
-      total,
-      foraIgreja,
-      igreja,
-      votosNene,
-      votosRenilce,
-      rankingCidades,
-      rankingBairros
-    });
-  });
+      const rankingBairros = await query<any>(`
+        SELECT bairro, SUM(votos_nene + votos_renilce) AS total_votos
+        FROM liderancas
+        GROUP BY bairro
+        ORDER BY total_votos DESC
+        LIMIT 5
+      `);
 
-  app.get("/api/liderancas", (req, res) => {
-    const { search, grupo, cidade, situacao } = req.query;
-    let query = "SELECT * FROM liderancas WHERE 1=1";
-    const params = [];
-
-    if (search) {
-      query += " AND (nome_lideranca LIKE ? OR fone_zap LIKE ? OR cidade LIKE ? OR bairro LIKE ?)";
-      const s = `%${search}%`;
-      params.push(s, s, s, s);
+      res.json({
+        total:         totalRow.count,
+        foraIgreja:    foraIgrejaRow.count,
+        igreja:        igrejaRow.count,
+        votosNene:     votosNeneRow.soma,
+        votosRenilce:  votosRenilceRow.soma,
+        rankingCidades,
+        rankingBairros,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
-    if (grupo) {
-      query += " AND grupo = ?";
-      params.push(grupo);
+  });
+
+  // ── API: Lideranças ──────────────────────────────────────────────────────
+  app.get("/api/liderancas", async (req, res) => {
+    try {
+      const { search, grupo, cidade, situacao } = req.query;
+      let sql    = "SELECT * FROM liderancas WHERE 1=1";
+      const params: any[] = [];
+
+      if (search) {
+        sql += " AND (nome_lideranca LIKE ? OR fone_zap LIKE ? OR cidade LIKE ? OR bairro LIKE ?)";
+        const s = `%${search}%`;
+        params.push(s, s, s, s);
+      }
+      if (grupo)   { sql += " AND grupo = ?";   params.push(grupo); }
+      if (cidade)  { sql += " AND cidade = ?";  params.push(cidade); }
+      if (situacao){ sql += " AND situacao = ?"; params.push(situacao); }
+
+      sql += " ORDER BY data_atualizacao DESC";
+      const rows = await query(sql, params);
+      res.json(rows);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
-    if (cidade) {
-      query += " AND cidade = ?";
-      params.push(cidade);
+  });
+
+  app.get("/api/liderancas/:id", async (req, res) => {
+    try {
+      const [row] = await query("SELECT * FROM liderancas WHERE id = ?", [req.params.id]);
+      row ? res.json(row) : res.status(404).json({ error: "Não encontrado" });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
-    if (situacao) {
-      query += " AND situacao = ?";
-      params.push(situacao);
+  });
+
+  app.post("/api/liderancas", async (req, res) => {
+    try {
+      const d = req.body;
+      const result = await execute(`
+        INSERT INTO liderancas (
+          grupo, nome_lideranca, data_aniversario, fone_zap, cidade, bairro,
+          indicacao, acompanhado_por, situacao, demanda_recebida, compromisso_politico,
+          percentual_votos_municipio, ultima_visita, votos_nene, votos_renilce,
+          observacoes, responsavel_cadastro, proxima_visita, prioridade
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `, [
+        d.grupo, d.nome_lideranca, d.data_aniversario || null, d.fone_zap,
+        d.cidade, d.bairro, d.indicacao, d.acompanhado_por, d.situacao,
+        d.demanda_recebida, d.compromisso_politico, d.percentual_votos_municipio || 0,
+        d.ultima_visita || null, d.votos_nene || 0, d.votos_renilce || 0,
+        d.observacoes, d.responsavel_cadastro, d.proxima_visita || null, d.prioridade,
+      ]);
+      res.json({ id: result.insertId });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
-
-    query += " ORDER BY data_atualizacao DESC";
-    const rows = db.prepare(query).all(...params);
-    res.json(rows);
   });
 
-  app.post("/api/liderancas", (req, res) => {
-    const data = req.body;
-    const stmt = db.prepare(`
-      INSERT INTO liderancas (
-        grupo, nome_lideranca, data_aniversario, fone_zap, cidade, bairro, 
-        indicacao, acompanhado_por, situacao, demanda_recebida, compromisso_politico, 
-        percentual_votos_municipio, ultima_visita, votos_nene, votos_renilce, 
-        observacoes, responsavel_cadastro, proxima_visita, prioridade
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    const info = stmt.run(
-      data.grupo, data.nome_lideranca, data.data_aniversario, data.fone_zap, data.cidade, data.bairro,
-      data.indicacao, data.acompanhado_por, data.situacao, data.demanda_recebida, data.compromisso_politico,
-      data.percentual_votos_municipio, data.ultima_visita, data.votos_nene, data.votos_renilce,
-      data.observacoes, data.responsavel_cadastro, data.proxima_visita, data.prioridade
-    );
-    res.json({ id: info.lastInsertRowid });
+  app.put("/api/liderancas/:id", async (req, res) => {
+    try {
+      const d = req.body;
+      await execute(`
+        UPDATE liderancas SET
+          grupo = ?, nome_lideranca = ?, data_aniversario = ?, fone_zap = ?,
+          cidade = ?, bairro = ?, indicacao = ?, acompanhado_por = ?,
+          situacao = ?, demanda_recebida = ?, compromisso_politico = ?,
+          percentual_votos_municipio = ?, ultima_visita = ?, votos_nene = ?,
+          votos_renilce = ?, observacoes = ?, proxima_visita = ?, prioridade = ?,
+          data_atualizacao = NOW()
+        WHERE id = ?
+      `, [
+        d.grupo, d.nome_lideranca, d.data_aniversario || null, d.fone_zap,
+        d.cidade, d.bairro, d.indicacao, d.acompanhado_por, d.situacao,
+        d.demanda_recebida, d.compromisso_politico, d.percentual_votos_municipio || 0,
+        d.ultima_visita || null, d.votos_nene || 0, d.votos_renilce || 0,
+        d.observacoes, d.proxima_visita || null, d.prioridade,
+        req.params.id,
+      ]);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.put("/api/liderancas/:id", (req, res) => {
-    const { id } = req.params;
-    const data = req.body;
-    const stmt = db.prepare(`
-      UPDATE liderancas SET 
-        grupo = ?, nome_lideranca = ?, data_aniversario = ?, fone_zap = ?, cidade = ?, bairro = ?, 
-        indicacao = ?, acompanhado_por = ?, situacao = ?, demanda_recebida = ?, compromisso_politico = ?, 
-        percentual_votos_municipio = ?, ultima_visita = ?, votos_nene = ?, votos_renilce = ?, 
-        observacoes = ?, data_atualizacao = CURRENT_TIMESTAMP, proxima_visita = ?, prioridade = ?
-      WHERE id = ?
-    `);
-    stmt.run(
-      data.grupo, data.nome_lideranca, data.data_aniversario, data.fone_zap, data.cidade, data.bairro,
-      data.indicacao, data.acompanhado_por, data.situacao, data.demanda_recebida, data.compromisso_politico,
-      data.percentual_votos_municipio, data.ultima_visita, data.votos_nene, data.votos_renilce,
-      data.observacoes, data.proxima_visita, data.prioridade, id
-    );
-    res.json({ success: true });
+  // ── API: Visitas ─────────────────────────────────────────────────────────
+  app.get("/api/liderancas/:id/visitas", async (req, res) => {
+    try {
+      const rows = await query(
+        "SELECT * FROM visitas WHERE lideranca_id = ? ORDER BY data_visita DESC",
+        [req.params.id]
+      );
+      res.json(rows);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.get("/api/liderancas/:id", (req, res) => {
-    const row = db.prepare("SELECT * FROM liderancas WHERE id = ?").get(req.params.id);
-    res.json(row);
+  app.post("/api/liderancas/:id/visitas", async (req, res) => {
+    try {
+      const { data_visita, relato, responsavel } = req.body;
+      await execute(
+        "INSERT INTO visitas (lideranca_id, data_visita, relato, responsavel) VALUES (?,?,?,?)",
+        [req.params.id, data_visita, relato, responsavel]
+      );
+      await execute(
+        "UPDATE liderancas SET ultima_visita = ? WHERE id = ?",
+        [data_visita, req.params.id]
+      );
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.get("/api/liderancas/:id/visitas", (req, res) => {
-    const rows = db.prepare("SELECT * FROM visitas WHERE lideranca_id = ? ORDER BY data_visita DESC").all(req.params.id);
-    res.json(rows);
+  // ── API: Demandas ────────────────────────────────────────────────────────
+  app.get("/api/liderancas/:id/demandas", async (req, res) => {
+    try {
+      const rows = await query(
+        "SELECT * FROM demandas WHERE lideranca_id = ? ORDER BY data_abertura DESC",
+        [req.params.id]
+      );
+      res.json(rows);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.post("/api/liderancas/:id/visitas", (req, res) => {
-    const { id } = req.params;
-    const { data_visita, relato, responsavel } = req.body;
-    db.prepare("INSERT INTO visitas (lideranca_id, data_visita, relato, responsavel) VALUES (?, ?, ?, ?)").run(id, data_visita, relato, responsavel);
-    db.prepare("UPDATE liderancas SET ultima_visita = ? WHERE id = ?").run(data_visita, id);
-    res.json({ success: true });
+  app.post("/api/liderancas/:id/demandas", async (req, res) => {
+    try {
+      await execute(
+        "INSERT INTO demandas (lideranca_id, descricao) VALUES (?,?)",
+        [req.params.id, req.body.descricao]
+      );
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.get("/api/liderancas/:id/demandas", (req, res) => {
-    const rows = db.prepare("SELECT * FROM demandas WHERE lideranca_id = ? ORDER BY data_abertura DESC").all(req.params.id);
-    res.json(rows);
+  // ── API: Agendas ─────────────────────────────────────────────────────────
+  app.get("/api/agendas", async (_req, res) => {
+    try {
+      const rows = await query("SELECT * FROM agendas ORDER BY data ASC, hora ASC");
+      res.json(rows);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.post("/api/liderancas/:id/demandas", (req, res) => {
-    const { id } = req.params;
-    const { descricao } = req.body;
-    db.prepare("INSERT INTO demandas (lideranca_id, descricao) VALUES (?, ?)").run(id, descricao);
-    res.json({ success: true });
+  app.post("/api/agendas", async (req, res) => {
+    try {
+      const d = req.body;
+      const result = await execute(
+        "INSERT INTO agendas (titulo, data, hora, cidade, local, descricao, aviso, status) VALUES (?,?,?,?,?,?,?,?)",
+        [d.titulo, d.data, d.hora || null, d.cidade, d.local, d.descricao, d.aviso ? 1 : 0, d.status || "pendente"]
+      );
+      res.json({ id: result.insertId });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  // Agenda Routes
-  app.get("/api/agendas", (req, res) => {
-    const rows = db.prepare("SELECT * FROM agendas ORDER BY data ASC, hora ASC").all();
-    res.json(rows);
+  app.put("/api/agendas/:id", async (req, res) => {
+    try {
+      const d = req.body;
+      await execute(
+        "UPDATE agendas SET titulo=?, data=?, hora=?, cidade=?, local=?, descricao=?, aviso=?, status=? WHERE id=?",
+        [d.titulo, d.data, d.hora || null, d.cidade, d.local, d.descricao, d.aviso ? 1 : 0, d.status, req.params.id]
+      );
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.post("/api/agendas", (req, res) => {
-    const data = req.body;
-    const stmt = db.prepare(`
-      INSERT INTO agendas (titulo, data, hora, cidade, local, descricao, aviso, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(
-      data.titulo, data.data, data.hora, data.cidade, data.local, data.descricao, 
-      data.aviso ? 1 : 0, data.status || 'pendente'
-    );
-    res.json({ id: info.lastInsertRowid });
+  app.delete("/api/agendas/:id", async (req, res) => {
+    try {
+      await execute("DELETE FROM agendas WHERE id = ?", [req.params.id]);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
-  app.put("/api/agendas/:id", (req, res) => {
-    const { id } = req.params;
-    const data = req.body;
-    const stmt = db.prepare(`
-      UPDATE agendas SET 
-        titulo = ?, data = ?, hora = ?, cidade = ?, local = ?, 
-        descricao = ?, aviso = ?, status = ?
-      WHERE id = ?
-    `);
-    stmt.run(
-      data.titulo, data.data, data.hora, data.cidade, data.local, 
-      data.descricao, data.aviso ? 1 : 0, data.status, id
-    );
-    res.json({ success: true });
-  });
-
-  app.delete("/api/agendas/:id", (req, res) => {
-    db.prepare("DELETE FROM agendas WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
-  });
-
-  // Vite integration
+  // ── Vite / Static ────────────────────────────────────────────────────────
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -292,14 +298,14 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
   });
 }
 
